@@ -22,3 +22,7 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+yarn.lock
+package-lock.json
+composer.lock
