@@ -14,7 +14,8 @@ class CrawlCustomers extends Command
      *
      * @var string
      */
-    protected $signature = 'crawl:customers {--limit=100} {--page=1} {--search-word=} {--sort-key=1} {--sort-order=2} {--output=storage/app/public/customers.csv} {--login-url=https://grow-appt.com/shopmaster/api/sign_in} {--loginid} {--password}';
+    // protected $signature = 'crawl:customers {--limit=1000} {--page=1} {--search-word=} {--sort-key=1} {--sort-order=2} {--output=storage/app/public/customers.csv} {--login-url=https://grow-appt.com/shopmaster/api/sign_in} {--loginid} {--password}';
+    protected $signature = 'crawl:customers {--limit=1000} {--page=1} {--from-page=1} {--to-page=} {--all} {--sleep-ms=500} {--search-word=} {--sort-key=1} {--sort-order=2} {--output=storage/app/private/customers.csv} {--login-url=https://grow-appt.com/shopmaster/api/sign_in} {--loginid=} {--password=}';
 
     /**
      * The console command description.
@@ -35,12 +36,18 @@ class CrawlCustomers extends Command
         $sortKey = (int) $this->option('sort-key');
         $sortOrder = (int) $this->option('sort-order');
 
+        $all = (bool) $this->option('all');
+        $fromPage = (int) $this->option('from-page');
+        $toPageOpt = $this->option('to-page');
+        $toPage = $toPageOpt === null || $toPageOpt === '' ? PHP_INT_MAX : (int) $toPageOpt;
+        $sleepMs = (int) $this->option('sleep-ms');
+
         $api = 'https://grow-appt.com/shopmaster/api/customers';
         $loginUrl = (string) $this->option('login-url');
 
         $username = (string) ($this->option('loginid') ?: env('GROWAPPT_LOGIN_ID', ''));
         $password = (string) ($this->option('password') ?: env('GROWAPPT_PASSWORD', ''));
-        
+
         if ($username === '') {
             $username = (string) $this->ask('Enter grow-appt loginid');
         }
@@ -95,7 +102,11 @@ class CrawlCustomers extends Command
                 if (is_array($loginJson)) {
                     // Common token keys
                     $candidates = [
-                        'access_token', 'accessToken', 'token', 'jwt', 'data',
+                        'access_token',
+                        'accessToken',
+                        'token',
+                        'jwt',
+                        'data',
                     ];
                     foreach ($candidates as $key) {
                         if (!isset($loginJson[$key])) {
@@ -219,39 +230,172 @@ class CrawlCustomers extends Command
             }
         }
 
-        $fp = @fopen($absoluteOutput, 'w');
-        if ($fp === false) {
-            $this->error('Unable to open output file for writing: ' . $absoluteOutput);
+        // Prepare in-memory collectors for duplicate detection by tel
+        $allRows = [];
+        $telCounts = [];
+        $normalizeTel = function ($tel) {
+            return preg_replace('/\D+/', '', (string) $tel);
+        };
+
+        // Helper to extract customers array from any response shape
+        $extractCustomers = function ($data) {
+            if (is_array($data)) {
+                if (array_is_list($data)) {
+                    return $data;
+                }
+                if (isset($data['data']) && is_array($data['data'])) {
+                    return $data['data'];
+                }
+                if (isset($data['customers']) && is_array($data['customers'])) {
+                    return $data['customers'];
+                }
+            }
+            return [];
+        };
+
+        $totalWritten = 0;
+
+        // Determine page range
+        $startPage = $all ? max(1, $fromPage) : (int) $this->option('page');
+        $endPage = $all ? $toPage : $startPage;
+
+        for ($page = $startPage; $page <= $endPage; $page++) {
+            $this->info("Fetching page {$page} ...");
+
+            try {
+                $response = $client->get($api, [
+                    'query' => [
+                        'limit' => $limit,
+                        'page' => $page,
+                        'search_word' => $searchWord,
+                        'sort_key' => $sortKey,
+                        'sort_order' => $sortOrder,
+                    ],
+                    'headers' => [
+                        'Accept' => 'application/json',
+                        'Authorization' => 'Bearer ' . $accessToken,
+                        'X-Requested-With' => 'XMLHttpRequest',
+                    ],
+                ]);
+            } catch (\Throwable $e) {
+                $this->error('Failed to request API on page ' . $page . ': ' . $e->getMessage());
+                break;
+            }
+
+            if ($response->getStatusCode() !== 200) {
+                $this->warn('Non-200 status on page ' . $page . ': ' . $response->getStatusCode());
+                break;
+            }
+
+            $body = (string) $response->getBody();
+            try {
+                $data = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\Throwable $e) {
+                $this->error('Failed to parse JSON on page ' . $page . ': ' . $e->getMessage());
+                break;
+            }
+
+            $customers = $extractCustomers($data);
+
+            // Stop if no more data
+            if (empty($customers)) {
+                if ($all) {
+                    $this->info('No data returned; stopping at page ' . $page . '.');
+                }
+                break;
+            }
+
+            // Collect rows (accumulate across pages)
+            foreach ($customers as $item) {
+                if (!is_array($item)) {
+                    continue;
+                }
+                $row = [];
+                foreach ($columns as $key) {
+                    $value = $item[$key] ?? $item[strtoupper($key)] ?? $item[ucfirst($key)] ?? '';
+                    if (is_array($value) || is_object($value)) {
+                        $value = json_encode($value, JSON_UNESCAPED_UNICODE);
+                    }
+                    $row[] = $value;
+                }
+                $telIndex = array_search('tel', $columns, true);
+                $telRaw = $telIndex !== false ? ($row[$telIndex] ?? '') : '';
+                $telNorm = $normalizeTel($telRaw);
+
+                if ($telNorm !== '') {
+                    $telCounts[$telNorm] = ($telCounts[$telNorm] ?? 0) + 1;
+                }
+
+                $allRows[] = [$row, $telNorm];
+                $totalWritten++;
+            }
+
+            // Respectful pacing
+            if ($sleepMs > 0) {
+                usleep($sleepMs * 1000);
+            }
+        }
+        // Write duplicates and unique CSVs
+        $dupesPath = $dir . '/' . $base . '_dupes_' . $timestamp . '.' . $ext;
+        $uniquePath = $dir . '/' . $base . '_unique_' . $timestamp . '.' . $ext;
+
+        $dupesFp = @fopen($dupesPath, 'w');
+        if ($dupesFp === false) {
+            $this->error('Unable to open duplicates file: ' . $dupesPath);
+            return self::FAILURE;
+        }
+        $uniqueFp = @fopen($uniquePath, 'w');
+        if ($uniqueFp === false) {
+            fclose($dupesFp);
+            $this->error('Unable to open unique file: ' . $uniquePath);
             return self::FAILURE;
         }
 
-        // Write header
-        fputcsv($fp, $columns);
+        fputcsv($dupesFp, $columns);
+        fputcsv($uniqueFp, $columns);
 
-        foreach ($customers as $item) {
-            if (!is_array($item)) {
-                continue;
-            }
-
-            $row = [];
-            foreach ($columns as $key) {
-                // Try direct key; if not present, try common alternative casings
-                $value = $item[$key] ?? $item[strtoupper($key)] ?? $item[ucfirst($key)] ?? '';
-                // Normalize scalars
-                if (is_array($value) || is_object($value)) {
-                    $value = json_encode($value, JSON_UNESCAPED_UNICODE);
+        // Build groups for duplicates by normalized tel
+        $dupeGroups = [];
+        $uniqueRows = [];
+        foreach ($allRows as [$row, $telNorm]) {
+            if ($telNorm !== '' && ($telCounts[$telNorm] ?? 0) > 1) {
+                if (!isset($dupeGroups[$telNorm])) {
+                    $dupeGroups[$telNorm] = [];
                 }
-                $row[] = $value;
+                $dupeGroups[$telNorm][] = $row;
+            } else {
+                $uniqueRows[] = $row;
             }
-
-            fputcsv($fp, $row);
         }
 
-        fclose($fp);
+        // Write duplicates grouped by tel, with a blank line between groups
+        ksort($dupeGroups, SORT_STRING);
+        $dupesCount = 0;
+        $firstGroup = true;
+        foreach ($dupeGroups as $telNorm => $rows) {
+            if (!$firstGroup) {
+                fputcsv($dupesFp, array_fill(0, count($columns), ''));
+            }
+            $firstGroup = false;
+            foreach ($rows as $row) {
+                fputcsv($dupesFp, $row);
+                $dupesCount++;
+            }
+        }
 
-        $this->info('CSV exported: ' . $absoluteOutput);
+        // Write unique rows
+        $uniqueCount = 0;
+        foreach ($uniqueRows as $row) {
+            fputcsv($uniqueFp, $row);
+            $uniqueCount++;
+        }
+
+        fclose($dupesFp);
+        fclose($uniqueFp);
+
+        $this->info('Total rows processed: ' . $totalWritten);
+        $this->info('Duplicates CSV: ' . $dupesPath . ' (' . $dupesCount . ' rows)');
+        $this->info('Unique CSV: ' . $uniquePath . ' (' . $uniqueCount . ' rows)');
         return self::SUCCESS;
     }
 }
-
-
